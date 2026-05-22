@@ -38,7 +38,7 @@ fn main() -> eframe::Result<()> {
     // with their saved log level. Otherwise the form's log-level combobox
     // would only ever take effect via env var or after Save → restart, and
     // users on the UI binary (issue #401) reasonably expect the saved
-    // config.json `log_level` to apply at boot like it does for the CLI.
+    // config.toml `log_level` to apply at boot like it does for the CLI.
     let (form, load_err) = load_form();
     let initial_toast = load_err.map(|e| (e, Instant::now()));
 
@@ -252,36 +252,36 @@ struct FormState {
     normalize_x_graphql: bool,
     youtube_via_relay: bool,
     passthrough_hosts: Vec<String>,
-    /// Round-tripped from config.json so the UI's save path doesn't
+    /// Round-tripped from config.toml so the UI's save path doesn't
     /// drop the user's setting. Not currently exposed as a UI control;
-    /// users edit `block_quic` directly in `config.json` (Issue #213).
+    /// users edit `block_quic` directly in `config.toml` (Issue #213).
     block_quic: bool,
-    /// Round-tripped from config.json and exposed beside QUIC blocking.
+    /// Round-tripped from config.toml and exposed beside QUIC blocking.
     /// Default true to push WebRTC apps toward TCP TURN instead of slow
     /// UDP ICE retries.
     block_stun: bool,
-    /// Round-tripped from config.json. Not exposed as a UI control —
+    /// Round-tripped from config.toml. Not exposed as a UI control —
     /// users edit `disable_padding` directly when needed (Issue #391).
     /// Default false (padding active).
     disable_padding: bool,
-    /// Round-tripped from config.json. Not exposed as a UI control —
+    /// Round-tripped from config.toml. Not exposed as a UI control —
     /// users edit `force_http1` directly when needed. Default false
     /// (HTTP/2 multiplexing on the relay leg active).
     force_http1: bool,
-    /// Round-tripped from config.json. Not exposed in the UI form yet —
+    /// Round-tripped from config.toml. Not exposed in the UI form yet —
     /// the bypass-DoH default is the right answer for almost everyone
     /// (DoH already encrypts, the tunnel was just adding latency), so
     /// this is a config-only opt-out. See config.rs `tunnel_doh`.
     tunnel_doh: bool,
     /// User-supplied DoH hostnames added to the built-in default list,
-    /// round-tripped from config.json. See config.rs `bypass_doh_hosts`.
+    /// round-tripped from config.toml. See config.rs `bypass_doh_hosts`.
     bypass_doh_hosts: Vec<String>,
     /// PR #763: when true, immediately reject browser DoH CONNECTs so the
     /// browser falls back to system DNS (tun2proxy virtual DNS — instant).
-    /// Round-tripped from config.json. Desktop UI doesn't expose a toggle
+    /// Round-tripped from config.toml. Desktop UI doesn't expose a toggle
     /// yet — Android does. See config.rs `block_doh`.
     block_doh: bool,
-    /// Multi-edge fronting groups. Round-tripped from config.json so
+    /// Multi-edge fronting groups. Round-tripped from config.toml so
     /// the UI's Save doesn't drop the user's hand-edited groups —
     /// there is no UI editor for these yet, only file-edited config.
     /// See config.rs `fronting_groups`.
@@ -311,28 +311,17 @@ fn load_form() -> (FormState, Option<String>) {
     // fails so the user isn't silently shown a blank form (issue: user reports
     // 'settings saved to file but not loaded back'). Without this signal the
     // failure is invisible — `.ok()` swallows it and the form looks fresh.
-    let path = data_dir::config_path();
-    let cwd = PathBuf::from("config.json");
+    let path = data_dir::resolve_config_path(None);
 
     let (existing, load_err): (Option<Config>, Option<String>) = if path.exists() {
         tracing::info!("config: attempting load from {}", path.display());
         match Config::load(&path) {
-            Ok(c) => {
+            Ok((c, _)) => {
                 tracing::info!("config: loaded OK from {}", path.display());
                 (Some(c), None)
             }
             Err(e) => {
                 let msg = format!("Config at {} failed to load: {}", path.display(), e);
-                tracing::warn!("{}", msg);
-                (None, Some(msg))
-            }
-        }
-    } else if cwd.exists() {
-        tracing::info!("config: attempting fallback load from {}", cwd.display());
-        match Config::load(&cwd) {
-            Ok(c) => (Some(c), None),
-            Err(e) => {
-                let msg = format!("Config at {} failed to load: {}", cwd.display(), e);
                 tracing::warn!("{}", msg);
                 (None, Some(msg))
             }
@@ -609,7 +598,7 @@ impl FormState {
             // tun2proxy's virtual DNS handles name lookups, saving the
             // ~1.5s tunnel round-trip per DNS query). Desktop UI doesn't
             // expose a toggle yet (Android does), so this is a config-only
-            // round-trip — we keep whatever the user has in config.json.
+            // round-trip — we keep whatever the user has in config.toml.
             block_doh: self.block_doh,
             // Multi-edge fronting groups: file-edited only for now,
             // round-tripped through the UI so Save doesn't drop them.
@@ -642,165 +631,10 @@ fn save_config(cfg: &Config) -> Result<PathBuf, String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    let json = serde_json::to_string_pretty(&ConfigWire::from(cfg)).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| e.to_string())?;
+    let toml_str = toml::to_string_pretty(&mhrv_rs::config::TomlConfig::from(cfg))
+        .map_err(|e| e.to_string())?;
+    std::fs::write(&path, toml_str).map_err(|e| e.to_string())?;
     Ok(path)
-}
-
-#[derive(serde::Serialize)]
-struct ConfigWire<'a> {
-    mode: &'a str,
-    google_ip: &'a str,
-    front_domain: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    script_id: Option<ScriptIdWire<'a>>,
-    auth_key: &'a str,
-    listen_host: &'a str,
-    listen_port: u16,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    socks5_port: Option<u16>,
-    log_level: &'a str,
-    verify_ssl: bool,
-    #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
-    hosts: &'a std::collections::HashMap<String, String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    upstream_socks5: Option<&'a str>,
-    #[serde(skip_serializing_if = "is_zero_u8")]
-    parallel_relay: u8,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    sni_hosts: Option<Vec<&'a str>>,
-    #[serde(skip_serializing_if = "is_false")]
-    normalize_x_graphql: bool,
-    #[serde(skip_serializing_if = "is_false")]
-    youtube_via_relay: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    passthrough_hosts: &'a Vec<String>,
-    // IP-scan knobs. These used to be missing from the wire struct, so
-    // every Save-config silently dropped them — the user would toggle
-    // "fetch from API" on, save, reopen, and find it off again. Add
-    // them here and keep them in sync if Config ever grows more.
-    #[serde(skip_serializing_if = "is_false")]
-    fetch_ips_from_api: bool,
-    max_ips_to_scan: usize,
-    scan_batch_size: usize,
-    google_ip_validation: bool,
-    /// Default false (= bypass DoH). Only emitted when explicitly true
-    /// so unchanged configs stay clean.
-    #[serde(skip_serializing_if = "is_false")]
-    tunnel_doh: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    bypass_doh_hosts: &'a Vec<String>,
-    /// PR #763: default true (= browser DoH rejected, system DNS used).
-    /// Skip when matching default to keep unchanged configs clean —
-    /// emit only when the user has explicitly disabled the block.
-    #[serde(skip_serializing_if = "is_true")]
-    block_doh: bool,
-    /// Default false. Emit only when the user enables STUN/TURN blocking.
-    #[serde(skip_serializing_if = "is_false")]
-    block_stun: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    fronting_groups: &'a Vec<FrontingGroup>,
-    /// Auto-blacklist tuning + batch timeout (#391, #444, #430). Skip
-    /// serialization when matching the historical defaults so unchanged
-    /// configs stay clean — only emitted when the user has explicitly
-    /// tuned them.
-    #[serde(skip_serializing_if = "is_default_strikes")]
-    auto_blacklist_strikes: u32,
-    #[serde(skip_serializing_if = "is_default_window_secs")]
-    auto_blacklist_window_secs: u64,
-    #[serde(skip_serializing_if = "is_default_cooldown_secs")]
-    auto_blacklist_cooldown_secs: u64,
-    #[serde(skip_serializing_if = "is_default_timeout_secs")]
-    request_timeout_secs: u64,
-    /// HTTP/2 multiplexing kill switch. Default false (h2 active); only
-    /// emitted on save when the user has explicitly disabled h2, so
-    /// unchanged configs stay clean.
-    #[serde(skip_serializing_if = "is_false")]
-    force_http1: bool,
-    /// Exit-node config (CF-anti-bot bypass for chatgpt.com / claude.ai /
-    /// grok.com / x.com via exit-node second-hop relay). Skip when fully
-    /// default (disabled with no URL/PSK/hosts) so configs without
-    /// exit-node setup stay clean. Round-tripped through FormState so
-    /// Save preserves user-edited values.
-    #[serde(skip_serializing_if = "is_default_exit_node")]
-    exit_node: &'a mhrv_rs::config::ExitNodeConfig,
-}
-
-fn is_default_strikes(v: &u32) -> bool { *v == 3 }
-fn is_default_window_secs(v: &u64) -> bool { *v == 30 }
-fn is_default_cooldown_secs(v: &u64) -> bool { *v == 120 }
-fn is_default_timeout_secs(v: &u64) -> bool { *v == 30 }
-fn is_default_exit_node(en: &&mhrv_rs::config::ExitNodeConfig) -> bool {
-    !en.enabled
-        && en.relay_url.is_empty()
-        && en.psk.is_empty()
-        && en.hosts.is_empty()
-        && (en.mode.is_empty() || en.mode == "selective")
-}
-
-fn is_false(b: &bool) -> bool {
-    !*b
-}
-
-fn is_true(b: &bool) -> bool {
-    *b
-}
-
-fn is_zero_u8(v: &u8) -> bool {
-    *v == 0
-}
-
-#[derive(serde::Serialize)]
-#[serde(untagged)]
-enum ScriptIdWire<'a> {
-    One(&'a str),
-    Many(Vec<&'a str>),
-}
-
-impl<'a> From<&'a Config> for ConfigWire<'a> {
-    fn from(c: &'a Config) -> Self {
-        let script_id = c.script_id.as_ref().map(|s| match s {
-            ScriptId::One(v) => ScriptIdWire::One(v.as_str()),
-            ScriptId::Many(v) => ScriptIdWire::Many(v.iter().map(String::as_str).collect()),
-        });
-        ConfigWire {
-            mode: c.mode.as_str(),
-            google_ip: c.google_ip.as_str(),
-            front_domain: c.front_domain.as_str(),
-            script_id,
-            auth_key: c.auth_key.as_str(),
-            listen_host: c.listen_host.as_str(),
-            listen_port: c.listen_port,
-            socks5_port: c.socks5_port,
-            log_level: c.log_level.as_str(),
-            verify_ssl: c.verify_ssl,
-            hosts: &c.hosts,
-            upstream_socks5: c.upstream_socks5.as_deref(),
-            parallel_relay: c.parallel_relay,
-            sni_hosts: c
-                .sni_hosts
-                .as_ref()
-                .map(|v| v.iter().map(String::as_str).collect()),
-            normalize_x_graphql: c.normalize_x_graphql,
-            youtube_via_relay: c.youtube_via_relay,
-            passthrough_hosts: &c.passthrough_hosts,
-            fetch_ips_from_api: c.fetch_ips_from_api,
-            max_ips_to_scan: c.max_ips_to_scan,
-            scan_batch_size: c.scan_batch_size,
-            google_ip_validation: c.google_ip_validation,
-            tunnel_doh: c.tunnel_doh,
-            bypass_doh_hosts: &c.bypass_doh_hosts,
-            block_doh: c.block_doh,
-            block_stun: c.block_stun,
-            fronting_groups: &c.fronting_groups,
-            auto_blacklist_strikes: c.auto_blacklist_strikes,
-            auto_blacklist_window_secs: c.auto_blacklist_window_secs,
-            auto_blacklist_cooldown_secs: c.auto_blacklist_cooldown_secs,
-            request_timeout_secs: c.request_timeout_secs,
-            force_http1: c.force_http1,
-            exit_node: &c.exit_node,
-        }
-    }
 }
 
 /// Accent color — same blue used throughout the UI for primary actions.
@@ -1092,7 +926,7 @@ impl eframe::App for App {
                 // text field — typing `0.0.0.0` from memory is enough of
                 // a friction point that almost no one does it. Power
                 // users with a custom bind IP (specific NIC) can still
-                // edit `listen_host` directly in `config.json`; we
+                // edit `listen_host` directly in `config.toml`; we
                 // detect that case and show a "Custom bind" badge so
                 // the checkbox doesn't silently overwrite their setting
                 // on the next Save.
@@ -1122,14 +956,14 @@ impl eframe::App for App {
                     if is_custom_bind {
                         // The user manually wrote a specific bind IP —
                         // don't let the checkbox stomp on it. Show what
-                        // they have and tell them to edit config.json
+                        // they have and tell them to edit config.toml
                         // if they want to change it.
                         ui.vertical(|ui| {
                             ui.label(egui::RichText::new(format!(
                                 "Custom bind: {}",
                                 listen_host_snapshot
                             )).color(egui::Color32::from_rgb(220, 180, 100)));
-                            ui.small("Edit `listen_host` in config.json to change.");
+                            ui.small("Edit `listen_host` in config.toml to change.");
                         });
                     } else {
                         let mut share = was_share_on_lan;
@@ -1608,7 +1442,7 @@ impl eframe::App for App {
                      and delete the on-disk ca/ directory. NSS cleanup (Firefox/Chrome) \
                      is best-effort and logs a hint if certutil is missing or a browser \
                      has the DB locked. A fresh CA is generated the next time you start \
-                     the proxy. Your config.json and the Apps Script deployment are NOT \
+                     the proxy. Your config.toml and the Apps Script deployment are NOT \
                      touched — no need to redeploy Code.gs."
                 };
                 ui.add_enabled_ui(!proxy_active && !running && !cert_op_in_flight, |ui| {
@@ -2412,7 +2246,7 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                             push_log(&shared2, &format!("[ui] {}", outcome.summary()));
                             push_log(
                                 &shared2,
-                                "[ui] config.json and Apps Script deployment untouched",
+                                "[ui] config.toml and Apps Script deployment untouched",
                             );
                         }
                         Err(e) => {

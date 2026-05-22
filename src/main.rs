@@ -43,12 +43,12 @@ USAGE:
     mhrv-rs test-sni [OPTIONS]         Probe each SNI name in the rotation pool against google_ip
 
 OPTIONS:
-    -c, --config PATH    Path to config.json (default: ./config.json)
+    -c, --config PATH    Path to config.toml file (default: <data-dir>/config.toml)
     --install-cert       Install the MITM CA certificate and exit
     --remove-cert        Remove the MITM CA from the OS trust store (verified by
                          name), then delete the on-disk ca/ directory and exit.
                          NSS cleanup (Firefox/Chrome) is best-effort. A fresh CA
-                         is generated on next run. config.json and your Apps
+                         is generated on next run. config.toml and your Apps
                          Script deployment are untouched.
     --no-cert-check      Skip the auto-install-if-untrusted check on startup
     -h, --help           Show this message
@@ -157,7 +157,7 @@ async fn main() -> ExitCode {
     };
 
     // --remove-cert runs without a valid config — the CA files may be
-    // the only thing present in the data dir. `config.json` and the
+    // the only thing present in the data dir. `config.toml` and the
     // Apps Script deployment are intentionally untouched: the user does
     // not have to redeploy Code.gs after regenerating the CA.
     if args.remove_cert {
@@ -201,12 +201,12 @@ async fn main() -> ExitCode {
     }
 
     let config_path = mhrv_rs::data_dir::resolve_config_path(args.config_path.as_deref());
-    let config = match Config::load(&config_path) {
+    let (config, migration_warn) = match Config::load(&config_path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("{}", e);
             eprintln!(
-                "No valid config found. Copy config.example.json to either:\n  {}\nor run with --config <path>.",
+                "No valid config found. Copy config.example.toml to either:\n  {}\nor run with --config <path>.",
                 config_path.display()
             );
             return ExitCode::FAILURE;
@@ -214,6 +214,9 @@ async fn main() -> ExitCode {
     };
 
     init_logging(&config.log_level);
+    if let Some(msg) = migration_warn {
+        tracing::warn!("{}", msg);
+    }
 
     // Bump RLIMIT_NOFILE now that tracing is live — OpenWRT/Alpine hosts
     // often ship a default so low (issue #8, issue #18) that we run out

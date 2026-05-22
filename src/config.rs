@@ -9,6 +9,8 @@ pub enum ConfigError {
     Read(String, #[source] std::io::Error),
     #[error("failed to parse config json: {0}")]
     Parse(#[from] serde_json::Error),
+    #[error("failed to parse config toml: {0}")]
+    ParseToml(#[from] toml::de::Error),
     #[error("invalid config: {0}")]
     Invalid(String),
 }
@@ -41,7 +43,7 @@ impl Mode {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum ScriptId {
     One(String),
@@ -549,12 +551,73 @@ fn default_verify_ssl() -> bool {
 }
 
 impl Config {
-    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+    pub fn load(path: &Path) -> Result<(Self, Option<String>), ConfigError> {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        match ext.as_str() {
+            "toml" => Self::load_toml(path).map(|c| (c, None)),
+            "json" => Self::load_json_and_migrate(path),
+            _ => {
+                // No extension or unrecognised: try TOML first, then JSON.
+                // JSON success also triggers migration. On double failure,
+                // surface the TOML error (the format new configs expect).
+                let toml_err = match Self::load_toml(path) {
+                    Ok(cfg) => return Ok((cfg, None)),
+                    Err(e) => e,
+                };
+                match Self::load_json_and_migrate(path) {
+                    Ok((cfg, msg)) => Ok((cfg, msg)),
+                    Err(_) => Err(toml_err),
+                }
+            }
+        }
+    }
+
+    pub fn load_toml(path: &Path) -> Result<Self, ConfigError> {
+        let data = std::fs::read_to_string(path)
+            .map_err(|e| ConfigError::Read(path.display().to_string(), e))?;
+        let toml_cfg: TomlConfig = toml::from_str(&data)
+            .map_err(ConfigError::ParseToml)?;
+        let cfg = Config::from(toml_cfg);
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    fn load_json_and_migrate(path: &Path) -> Result<(Self, Option<String>), ConfigError> {
         let data = std::fs::read_to_string(path)
             .map_err(|e| ConfigError::Read(path.display().to_string(), e))?;
         let cfg: Config = serde_json::from_str(&data)?;
         cfg.validate()?;
-        Ok(cfg)
+
+        // Write a .toml equivalent alongside the .json file. Failure is
+        // non-fatal: the in-memory Config is still valid and returned.
+        let toml_path = path.with_extension("toml");
+        let msg = match toml::to_string_pretty(&TomlConfig::from(&cfg)) {
+            Ok(toml_str) => match std::fs::write(&toml_path, &toml_str) {
+                Ok(()) => Some(format!(
+                    "Found legacy config.json. Translated to {} automatically. \
+                    config.json has been left in place but will no longer be read. \
+                    You can delete it.",
+                    toml_path.display()
+                )),
+                Err(e) => Some(format!(
+                    "Found legacy config.json but could not write {}: {}. \
+                    Continuing from the JSON config.",
+                    toml_path.display(), e
+                )),
+            },
+            Err(e) => Some(format!(
+                "Found legacy config.json but could not serialize to TOML: {}. \
+                Continuing from the JSON config.",
+                e
+            )),
+        };
+        
+    Ok((cfg, msg))
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
@@ -587,7 +650,7 @@ impl Config {
         if self.socks5_port == Some(self.listen_port) {
             return Err(ConfigError::Invalid(format!(
                 "listen_port and socks5_port must differ on the same host \
-                 (both set to {} on {}). Change one of them in config.json.",
+                 (both set to {} on {}). Change one of them in config.toml.",
                 self.listen_port, self.listen_host
             )));
         }
@@ -660,6 +723,259 @@ impl Config {
             return s.clone().into_vec();
         }
         Vec::new()
+    }
+}
+
+// TOML intermediate structs
+//
+// The flat `Config` struct and all its callers are unchanged. These structs
+// only exist inside Config::load_toml and the JSON->TOML migration writer.
+// Both paths produce a flat Config in the end via From<TomlConfig>.
+
+/// [relay] section of config.toml.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TomlRelay {
+    pub mode: String,
+    #[serde(default)]
+    pub script_id: Option<ScriptId>,
+    #[serde(default)]
+    pub script_ids: Option<ScriptId>,
+    #[serde(default)]
+    pub auth_key: String,
+    #[serde(default)]
+    pub parallel_relay: u8,
+    #[serde(default)]
+    pub enable_batching: bool,
+    #[serde(default)]
+    pub coalesce_step_ms: u16,
+    #[serde(default)]
+    pub coalesce_max_ms: u16,
+    #[serde(default)]
+    pub youtube_via_relay: bool,
+    #[serde(default)]
+    pub normalize_x_graphql: bool,
+    #[serde(default)]
+    pub disable_padding: bool,
+    #[serde(default)]
+    pub force_http1: bool,
+    #[serde(default = "default_auto_blacklist_strikes")]
+    pub auto_blacklist_strikes: u32,
+    #[serde(default = "default_auto_blacklist_window_secs")]
+    pub auto_blacklist_window_secs: u64,
+    #[serde(default = "default_auto_blacklist_cooldown_secs")]
+    pub auto_blacklist_cooldown_secs: u64,
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+}
+
+/// [network] section of config.toml.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TomlNetwork {
+    #[serde(default = "default_google_ip")]
+    pub google_ip: String,
+    #[serde(default = "default_front_domain")]
+    pub front_domain: String,
+    #[serde(default = "default_listen_host")]
+    pub listen_host: String,
+    #[serde(default = "default_listen_port")]
+    pub listen_port: u16,
+    #[serde(default)]
+    pub socks5_port: Option<u16>,
+    #[serde(default = "default_verify_ssl")]
+    pub verify_ssl: bool,
+    #[serde(default)]
+    pub upstream_socks5: Option<String>,
+    #[serde(default = "default_block_quic")]
+    pub block_quic: bool,
+    #[serde(default = "default_block_stun")]
+    pub block_stun: bool,
+    #[serde(default)]
+    pub sni_hosts: Option<Vec<String>>,
+    #[serde(default)]
+    pub passthrough_hosts: Vec<String>,
+    #[serde(default = "default_tunnel_doh")]
+    pub tunnel_doh: bool,
+    #[serde(default = "default_block_doh")]
+    pub block_doh: bool,
+    #[serde(default)]
+    pub bypass_doh_hosts: Vec<String>,
+    #[serde(default)]
+    pub hosts: HashMap<String, String>,
+}
+
+impl Default for TomlNetwork {
+    fn default() -> Self {
+        Self {
+            google_ip: default_google_ip(),
+            front_domain: default_front_domain(),
+            listen_host: default_listen_host(),
+            listen_port: default_listen_port(),
+            socks5_port: None,
+            verify_ssl: default_verify_ssl(),
+            upstream_socks5: None,
+            block_quic: default_block_quic(),
+            block_stun: default_block_stun(),
+            sni_hosts: None,
+            passthrough_hosts: Vec::new(),
+            tunnel_doh: default_tunnel_doh(),
+            block_doh: default_block_doh(),
+            bypass_doh_hosts: Vec::new(),
+            hosts: HashMap::new(),
+        }
+    }
+}
+
+/// [scan] section of config.toml.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TomlScan {
+    #[serde(default = "default_fetch_ips_from_api")]
+    pub fetch_ips_from_api: bool,
+    #[serde(default = "default_max_ips_to_scan")]
+    pub max_ips_to_scan: usize,
+    #[serde(default = "default_scan_batch_size")]
+    pub scan_batch_size: usize,
+    #[serde(default = "default_google_ip_validation")]
+    pub google_ip_validation: bool,
+}
+
+impl Default for TomlScan {
+    fn default() -> Self {
+        Self {
+            fetch_ips_from_api: default_fetch_ips_from_api(),
+            max_ips_to_scan: default_max_ips_to_scan(),
+            scan_batch_size: default_scan_batch_size(),
+            google_ip_validation: default_google_ip_validation(),
+        }
+    }
+}
+
+/// [logging] section of config.toml.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TomlLogging {
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+}
+
+impl Default for TomlLogging {
+    fn default() -> Self {
+        Self { log_level: default_log_level() }
+    }
+}
+
+/// Root config.toml document. Deserialized first, then flattened into
+/// `Config` via `From<TomlConfig>` so the rest of the codebase is untouched.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct TomlConfig {
+    pub relay: TomlRelay,
+    #[serde(default)]
+    pub network: TomlNetwork,
+    #[serde(default)]
+    pub scan: TomlScan,
+    #[serde(default)]
+    pub logging: TomlLogging,
+    #[serde(default)]
+    pub exit_node: ExitNodeConfig,
+    #[serde(default)]
+    pub fronting_groups: Vec<FrontingGroup>,
+}
+
+impl From<TomlConfig> for Config {
+    fn from(t: TomlConfig) -> Self {
+        Config {
+            mode: t.relay.mode,
+            google_ip: t.network.google_ip,
+            front_domain: t.network.front_domain,
+            script_id: t.relay.script_id,
+            script_ids: t.relay.script_ids,
+            auth_key: t.relay.auth_key,
+            listen_host: t.network.listen_host,
+            listen_port: t.network.listen_port,
+            socks5_port: t.network.socks5_port,
+            log_level: t.logging.log_level,
+            verify_ssl: t.network.verify_ssl,
+            hosts: t.network.hosts,
+            enable_batching: t.relay.enable_batching,
+            upstream_socks5: t.network.upstream_socks5,
+            parallel_relay: t.relay.parallel_relay,
+            coalesce_step_ms: t.relay.coalesce_step_ms,
+            coalesce_max_ms: t.relay.coalesce_max_ms,
+            sni_hosts: t.network.sni_hosts,
+            fetch_ips_from_api: t.scan.fetch_ips_from_api,
+            max_ips_to_scan: t.scan.max_ips_to_scan,
+            scan_batch_size: t.scan.scan_batch_size,
+            google_ip_validation: t.scan.google_ip_validation,
+            normalize_x_graphql: t.relay.normalize_x_graphql,
+            youtube_via_relay: t.relay.youtube_via_relay,
+            passthrough_hosts: t.network.passthrough_hosts,
+            block_stun: t.network.block_stun,
+            block_quic: t.network.block_quic,
+            disable_padding: t.relay.disable_padding,
+            force_http1: t.relay.force_http1,
+            tunnel_doh: t.network.tunnel_doh,
+            bypass_doh_hosts: t.network.bypass_doh_hosts,
+            block_doh: t.network.block_doh,
+            fronting_groups: t.fronting_groups,
+            auto_blacklist_strikes: t.relay.auto_blacklist_strikes,
+            auto_blacklist_window_secs: t.relay.auto_blacklist_window_secs,
+            auto_blacklist_cooldown_secs: t.relay.auto_blacklist_cooldown_secs,
+            request_timeout_secs: t.relay.request_timeout_secs,
+            exit_node: t.exit_node,
+        }
+    }
+}
+
+/// Used by the JSON->TOML migration write path: takes a reference so the
+/// flat Config can still be returned as Ok(config) after the TOML is written.
+impl From<&Config> for TomlConfig {
+    fn from(c: &Config) -> Self {
+        TomlConfig {
+            relay: TomlRelay {
+                mode: c.mode.clone(),
+                script_id: c.script_id.clone(),
+                script_ids: c.script_ids.clone(),
+                auth_key: c.auth_key.clone(),
+                parallel_relay: c.parallel_relay,
+                enable_batching: c.enable_batching,
+                coalesce_step_ms: c.coalesce_step_ms,
+                coalesce_max_ms: c.coalesce_max_ms,
+                youtube_via_relay: c.youtube_via_relay,
+                normalize_x_graphql: c.normalize_x_graphql,
+                disable_padding: c.disable_padding,
+                force_http1: c.force_http1,
+                auto_blacklist_strikes: c.auto_blacklist_strikes,
+                auto_blacklist_window_secs: c.auto_blacklist_window_secs,
+                auto_blacklist_cooldown_secs: c.auto_blacklist_cooldown_secs,
+                request_timeout_secs: c.request_timeout_secs,
+            },
+            network: TomlNetwork {
+                google_ip: c.google_ip.clone(),
+                front_domain: c.front_domain.clone(),
+                listen_host: c.listen_host.clone(),
+                listen_port: c.listen_port,
+                socks5_port: c.socks5_port,
+                verify_ssl: c.verify_ssl,
+                upstream_socks5: c.upstream_socks5.clone(),
+                block_quic: c.block_quic,
+                block_stun: c.block_stun,
+                sni_hosts: c.sni_hosts.clone(),
+                passthrough_hosts: c.passthrough_hosts.clone(),
+                tunnel_doh: c.tunnel_doh,
+                block_doh: c.block_doh,
+                bypass_doh_hosts: c.bypass_doh_hosts.clone(),
+                hosts: c.hosts.clone(),
+            },
+            scan: TomlScan {
+                fetch_ips_from_api: c.fetch_ips_from_api,
+                max_ips_to_scan: c.max_ips_to_scan,
+                scan_batch_size: c.scan_batch_size,
+                google_ip_validation: c.google_ip_validation,
+            },
+            logging: TomlLogging {
+                log_level: c.log_level.clone(),
+            },
+            exit_node: c.exit_node.clone(),
+            fronting_groups: c.fronting_groups.clone(),
+        }
     }
 }
 
@@ -899,7 +1215,7 @@ mod rt_tests {
 }"#;
         let tmp = std::env::temp_dir().join("mhrv-rt-test.json");
         std::fs::write(&tmp, json).unwrap();
-        let cfg = Config::load(&tmp).expect("config should load");
+        let cfg = Config::load(&tmp).expect("config should load").0;
         assert_eq!(cfg.mode, "apps_script");
         assert_eq!(cfg.auth_key, "testtesttest");
         assert_eq!(cfg.listen_port, 8085);
@@ -910,6 +1226,7 @@ mod rt_tests {
             &vec!["www.google.com".to_string(), "drive.google.com".to_string()]
         );
         assert_eq!(cfg.fetch_ips_from_api, true);
+        let _ = std::fs::remove_file(tmp.with_extension("toml"));
         let _ = std::fs::remove_file(&tmp);
     }
 
@@ -962,8 +1279,175 @@ mod rt_tests {
 }"#;
         let tmp = std::env::temp_dir().join("mhrv-rt-min.json");
         std::fs::write(&tmp, json).unwrap();
-        let cfg = Config::load(&tmp).expect("minimal config should load");
+        let cfg = Config::load(&tmp).expect("minimal config should load").0;
         assert_eq!(cfg.mode, "apps_script");
+        let _ = std::fs::remove_file(tmp.with_extension("toml"));
         let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod toml_tests {
+    use super::*;
+
+    #[test]
+    fn toml_parses_minimal_relay_section() {
+        let s = r#"
+[relay]
+mode = "apps_script"
+auth_key = "MY_SECRET_KEY_123"
+script_id = "ABCDEF"
+"#;
+        let toml_cfg: TomlConfig = toml::from_str(s).unwrap();
+        let cfg = Config::from(toml_cfg);
+        assert_eq!(cfg.mode, "apps_script");
+        assert_eq!(cfg.auth_key, "MY_SECRET_KEY_123");
+        assert_eq!(cfg.script_ids_resolved(), vec!["ABCDEF".to_string()]);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn toml_network_defaults_apply_when_section_omitted() {
+        // [network] section is entirely optional — all fields have defaults.
+        let s = r#"
+[relay]
+mode = "direct"
+"#;
+        let toml_cfg: TomlConfig = toml::from_str(s).unwrap();
+        let cfg = Config::from(toml_cfg);
+        assert_eq!(cfg.google_ip, "216.239.38.120");
+        assert_eq!(cfg.listen_port, 8085);
+        assert!(cfg.verify_ssl);
+        assert!(cfg.block_doh);
+        assert!(cfg.tunnel_doh);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn toml_parses_exit_node_section() {
+        let s = r#"
+[relay]
+mode = "apps_script"
+auth_key = "SECRET"
+script_id = "X"
+
+[exit_node]
+enabled = true
+relay_url = "https://example.com"
+psk = "mypsk"
+mode = "selective"
+hosts = ["claude.ai", "chatgpt.com"]
+"#;
+        let toml_cfg: TomlConfig = toml::from_str(s).unwrap();
+        let cfg = Config::from(toml_cfg);
+        cfg.validate().unwrap();
+        assert!(cfg.exit_node.enabled);
+        assert_eq!(cfg.exit_node.relay_url, "https://example.com");
+        assert_eq!(cfg.exit_node.hosts, vec!["claude.ai", "chatgpt.com"]);
+    }
+
+    #[test]
+    fn toml_parses_fronting_groups_array_of_tables() {
+        let s = r#"
+[relay]
+mode = "direct"
+
+[[fronting_groups]]
+name = "vercel"
+ip = "76.76.21.21"
+sni = "react.dev"
+domains = ["vercel.com", "nextjs.org"]
+
+[[fronting_groups]]
+name = "fastly"
+ip = "151.101.128.223"
+sni = "pypi.org"
+domains = ["reddit.com"]
+"#;
+        let toml_cfg: TomlConfig = toml::from_str(s).unwrap();
+        let cfg = Config::from(toml_cfg);
+        cfg.validate().unwrap();
+        assert_eq!(cfg.fronting_groups.len(), 2);
+        assert_eq!(cfg.fronting_groups[0].name, "vercel");
+        assert_eq!(cfg.fronting_groups[1].name, "fastly");
+    }
+
+    #[test]
+    fn toml_parses_network_hosts_subtable() {
+        let s = r#"
+[relay]
+mode = "direct"
+
+[network.hosts]
+"example.com" = "1.2.3.4"
+"test.example.com" = "5.6.7.8"
+"#;
+        let toml_cfg: TomlConfig = toml::from_str(s).unwrap();
+        let cfg = Config::from(toml_cfg);
+        assert_eq!(cfg.hosts.get("example.com"), Some(&"1.2.3.4".to_string()));
+        assert_eq!(cfg.hosts.get("test.example.com"), Some(&"5.6.7.8".to_string()));
+    }
+
+    #[test]
+    fn toml_multi_script_id_array() {
+        let s = r#"
+[relay]
+mode = "apps_script"
+auth_key = "SECRET"
+script_id = ["A", "B", "C"]
+"#;
+        let toml_cfg: TomlConfig = toml::from_str(s).unwrap();
+        let cfg = Config::from(toml_cfg);
+        assert_eq!(cfg.script_ids_resolved(), vec!["A", "B", "C"]);
+    }
+
+    #[test]
+    fn config_load_reads_toml_file_directly() {
+        let s = r#"
+[relay]
+mode = "apps_script"
+auth_key = "MY_SECRET_KEY_123"
+script_id = "ABCDEF"
+"#;
+        let tmp = std::env::temp_dir().join("mhrv-load-toml-test.toml");
+        std::fs::write(&tmp, s).unwrap();
+        let cfg = Config::load(&tmp).expect("Config::load must handle .toml extension").0;
+        assert_eq!(cfg.mode, "apps_script");
+        assert_eq!(cfg.script_ids_resolved(), vec!["ABCDEF".to_string()]);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn json_migration_writes_toml_alongside_and_result_roundtrips() {
+        let json = r#"{
+  "mode": "apps_script",
+  "auth_key": "MY_SECRET_KEY_123",
+  "script_id": "ABCDEF",
+  "listen_port": 8085
+}"#;
+        let dir = std::env::temp_dir();
+        let json_path = dir.join("mhrv-migration-test.json");
+        let toml_path = dir.join("mhrv-migration-test.toml");
+        let _ = std::fs::remove_file(&json_path);
+        let _ = std::fs::remove_file(&toml_path);
+
+        std::fs::write(&json_path, json).unwrap();
+        let cfg = Config::load(&json_path)
+            .expect("JSON config must load and trigger migration").0;
+
+        assert!(toml_path.exists(), "migration must write config.toml alongside config.json");
+
+        // The written TOML must parse back to an equivalent Config.
+        let toml_str = std::fs::read_to_string(&toml_path).unwrap();
+        let toml_cfg: TomlConfig = toml::from_str(&toml_str)
+            .expect("migrated TOML must be valid TOML");
+        let cfg2 = Config::from(toml_cfg);
+        assert_eq!(cfg.mode, cfg2.mode);
+        assert_eq!(cfg.auth_key, cfg2.auth_key);
+        assert_eq!(cfg.script_ids_resolved(), cfg2.script_ids_resolved());
+        assert_eq!(cfg.listen_port, cfg2.listen_port);
+
+        let _ = std::fs::remove_file(&json_path);
+        let _ = std::fs::remove_file(&toml_path);
     }
 }
